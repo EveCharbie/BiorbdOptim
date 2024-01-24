@@ -135,6 +135,7 @@ def prepare_socp(
         quadratic=True,
     )
 
+
     # Constraints
     constraints = ConstraintList()
     constraints.add(
