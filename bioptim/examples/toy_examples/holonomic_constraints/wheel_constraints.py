@@ -36,8 +36,8 @@ class ModifiedTorqueBiorbdModel(TorqueBiorbdModel):
             bio_model_path,
         )
 
-    @staticmethod
     def dynamics(
+        self,
         time,
         states,
         controls,
@@ -45,17 +45,81 @@ class ModifiedTorqueBiorbdModel(TorqueBiorbdModel):
         algebraic_states,
         numerical_timeseries,
         nlp,
-    ) -> DynamicsEvaluation:
+    ):
 
-        q = DynamicsFunctions.get(nlp.states["q"], states)
-        qdot = DynamicsFunctions.get(nlp.states["qdot"], states)
-        tau = DynamicsFunctions.get(nlp.controls["tau"], controls)
+        # Get states indices
+        q_indices, qdot_indices = self.get_q_qdot_indices(nlp)
 
-        qddot =
+        # Get variables
+        q, qdot, tau, external_forces = self.get_basic_variables(
+            nlp, states, controls, parameters, algebraic_states, numerical_timeseries
+        )
 
-        dxdt = vertcat(qdot, qddot)
+        # Initialize dxdt
+        dxdt = nlp.cx(nlp.states.shape, 1)
+        dxdt[q_indices, 0] = DynamicsFunctions.compute_qdot(nlp, q, qdot)
+        dxdt[qdot_indices, 0] = DynamicsFunctions.compute_qddot(nlp, q, qdot, tau, external_forces)
 
-        return DynamicsEvaluation(dxdt=dxdt, defects=None)
+        if nlp.model.fatigue is not None and "tau" in nlp.model.fatigue:
+            dxdt = nlp.model.fatigue["tau"].dynamics(dxdt, nlp, states, controls)
+
+        defects = None
+        if isinstance(nlp.dynamics_type.ode_solver, OdeSolver.COLLOCATION):
+
+            DynamicsFunctions.no_states_mapping(nlp)
+            slope_q, slope_qdot = self.get_basic_slopes(nlp)
+
+            # Initialize defects
+            defects = nlp.cx(nlp.states.shape, 1)
+
+            if nlp.dynamics_type.ode_solver.defects_type == DefectType.QDDOT_EQUALS_FORWARD_DYNAMICS:
+
+                dxdt_defects = nlp.cx(nlp.states.shape, 1)
+                dxdt_defects[q_indices, 0] = DynamicsFunctions.compute_qdot(nlp, q, qdot)
+                dxdt_defects[qdot_indices, 0] = DynamicsFunctions.forward_dynamics(
+                    nlp, q, qdot, tau, nlp.model.contact_types, external_forces
+                )
+
+                slopes = nlp.cx(nlp.states.shape, 1)
+                slopes[q_indices, 0] = slope_q
+                slopes[qdot_indices, 0] = slope_qdot
+
+                # Get fatigue defects
+                dxdt_defects, slopes = DynamicsFunctions.get_fatigue_defects(
+                    "tau",
+                    dxdt_defects,
+                    slopes,
+                    nlp,
+                    states,
+                    controls,
+                )
+
+                defects = slopes - dxdt_defects
+
+            elif nlp.dynamics_type.ode_solver.defects_type == DefectType.TAU_EQUALS_INVERSE_DYNAMICS:
+                if nlp.model.fatigue is not None:
+                    raise NotImplementedError("Fatigue is not implemented yet with inverse dynamics defects.")
+
+                defects[q_indices, 0] = slope_q - qdot
+
+                tau_id = DynamicsFunctions.inverse_dynamics(
+                    nlp,
+                    q=q,
+                    qdot=qdot,
+                    qddot=slope_qdot,
+                    contact_types=nlp.model.contact_types,
+                    external_forces=external_forces,
+                )
+                tau_defects = tau - tau_id
+                defects[qdot_indices, 0] = tau_defects
+            else:
+                raise NotImplementedError(
+                    f"The defect type {nlp.dynamics_type.ode_solver.defects_type} is not implemented yet for torque driven dynamics."
+                )
+
+            defects = vertcat(defects, DynamicsFunctions.get_contact_defects(nlp, q, qdot, slope_qdot))
+
+        return DynamicsEvaluation(dxdt=dxdt, defects=defects)
 
 
 def prepare_ocp(
